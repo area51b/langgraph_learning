@@ -1,421 +1,266 @@
-from langgraph.graph import StateGraph, START, END
+# Phase 3.2: ReAct Pattern in LangGraph
+# Concept: ReAct (Reasoning + Acting) is a powerful pattern where the agent:
+
+# 1. Reasons about what to do next
+# 2. Acts by calling tools or taking actions
+# 3. Observes the results
+# 4. Reflects and decides whether to continue or finish
+
+# This creates a loop: Reason → Act → Observe → Reflect → Reason...
+# Key Learning Points:
+
+# 1. Implement reasoning steps before actions
+# 2. Tool calling with reflection
+# 3. Looping until task completion
+# 4. Error handling with retry logic
+
+
+from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
-from typing import TypedDict, List, Literal, Annotated
-import operator
-import json
-import requests
-import math
+from typing import TypedDict, List, Dict, Any
 import os
+import json
+import math
+import requests
 
 # Load Gemini API Key
 load_dotenv()
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 
-# Define ReAct state schema
+# Define ReAct State Schema
 class ReActState(TypedDict):
-    query: str
-    thoughts: List[str]
-    actions: List[str]
-    observations: List[str]
+    input: str
+    thought: str
+    action: str
+    action_input: str
+    observation: str
     final_answer: str
-    iteration: int
-    max_iterations: int
-    tools_used: List[str]
+    step_count: int
+    max_steps: int
+    finished: bool
+    tools_used: List[str]  # Track which tools were used
 
-# Initialize LLM with function calling capability
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash-exp",
-    temperature=0.3,
-    max_tokens=2048
-)
-
-# =================================
-# DEFINE CUSTOM TOOLS
-# =================================
+# Tool definitions
+def calculator_tool(expression: str) -> str:
+    """Calculate mathematical expressions safely"""
+    try:
+        # Simple eval for basic math - in production, use a proper math parser
+        allowed_chars = set('0123456789+-*/.() ')
+        if not all(c in allowed_chars for c in expression):
+            return "Error: Invalid characters in expression"
+        result = eval(expression)
+        return f"Result: {result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 def web_search_tool(query: str) -> str:
-    """
-    Enhanced mock web search tool with more diverse results
-    """
-    # More comprehensive mock results that will trigger on specific keywords
+    """Mock web search tool - replace with real API in production"""
     mock_results = {
-        "weather": "Current weather: Sunny, 72°F with clear skies. Perfect for outdoor activities.",
-        "stock": "Stock market today: S&P 500 up 1.2%, Nasdaq up 0.8%, Dow Jones up 0.5%.",
-        "news": "Breaking news: Technology sector showing strong growth this quarter.",
-        "python": "Python is the most popular programming language in 2024, used by 68% of developers.",
-        "ai": "AI industry worth $184 billion in 2024, expected to reach $826 billion by 2030.",
-        "climate": "Climate change: Global temperatures have risen 1.1°C since pre-industrial times.",
-        "bitcoin": "Bitcoin price: $45,000 USD, up 3% in the last 24 hours.",
-        "covid": "COVID-19 update: New variant shows decreased severity, vaccination rates at 70%.",
-        "election": "2024 election results: Voter turnout was 65%, highest in recent history.",
-        "economy": "Economic outlook: GDP growth projected at 2.8% this year with low unemployment.",
-        "space": "Space exploration: Mars mission planned for 2026, SpaceX preparing for launch.",
-        "quantum": "Quantum computing breakthrough: IBM announces 1000-qubit processor.",
+        "weather": "Current weather in New York: 72°F, partly cloudy",
+        "python": "Python is a high-level programming language known for its simplicity",
+        "langgraph": "LangGraph is a framework for building stateful, multi-agent applications"
     }
     
-    # Try to find relevant information
-    query_lower = query.lower()
     for key, value in mock_results.items():
-        if key in query_lower:
-            return f"🔍 Search results for '{query}': {value}"
-    
-    # Generic fallback
-    return f"🔍 Search results for '{query}': Recent information about {query} shows ongoing developments in this area."
+        if key.lower() in query.lower():
+            return value
+    return f"Search results for '{query}': No specific results found"
 
-def calculator_tool(expression: str) -> str:
-    """
-    Safe calculator tool for mathematical expressions
-    """
+# Available tools registry
+TOOLS = {
+    "calculator": calculator_tool,
+    "web_search": web_search_tool
+}
+
+def reasoning_node(state: ReActState) -> ReActState:
+    """Agent thinks about what to do next"""
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp")
+    
+    # Build context from previous steps
+    context = f"""
+You are a helpful assistant that uses the ReAct pattern (Reasoning + Acting).
+You have access to these tools: {list(TOOLS.keys())}
+
+Task: {state['input']}
+Current step: {state['step_count']}
+
+Previous steps:
+"""
+    
+    if state.get('thought'):
+        context += f"Thought: {state['thought']}\n"
+    if state.get('action'):
+        context += f"Action: {state['action']}\n"
+    if state.get('observation'):
+        context += f"Observation: {state['observation']}\n"
+    
+    context += """
+Now think step by step about what to do next. You should:
+1. Reason about the current situation
+2. Decide if you need to use a tool or if you can provide a final answer
+3. If using a tool, specify which tool and what input to give it
+
+Respond in this format:
+Thought: [Your reasoning about what to do next]
+Action: [tool_name OR "final_answer"]
+Action Input: [input for the tool OR your final answer]
+"""
+    
     try:
-        # Safe evaluation of mathematical expressions
-        allowed_names = {
-            k: v for k, v in math.__dict__.items() if not k.startswith("_")
-        }
-        allowed_names.update({"abs": abs, "round": round, "min": min, "max": max})
+        response = llm.invoke(context)
+        content = response.content
         
-        result = eval(expression, {"__builtins__": {}}, allowed_names)
-        return f"Calculation result: {expression} = {result}"
+        # Parse the response
+        thought = ""
+        action = ""
+        action_input = ""
+        
+        for line in content.split('\n'):
+            if line.startswith('Thought:'):
+                thought = line.replace('Thought:', '').strip()
+            elif line.startswith('Action:'):
+                action = line.replace('Action:', '').strip()
+            elif line.startswith('Action Input:'):
+                action_input = line.replace('Action Input:', '').strip()
+        
+        state['thought'] = thought
+        state['action'] = action
+        state['action_input'] = action_input
+        state['step_count'] += 1
+        
+        return state
+        
     except Exception as e:
-        return f"Calculation error: {str(e)}"
+        state['thought'] = f"Error in reasoning: {str(e)}"
+        state['action'] = "final_answer"
+        state['action_input'] = "I encountered an error while processing your request."
+        return state
 
-def search_memory_tool(keyword: str) -> str:
-    """
-    Search through previous thoughts and observations
-    """
-    # This would search through conversation history in a real implementation
-    return f"Memory search for '{keyword}': This is a mock memory search result."
-
-# =================================
-# REACT AGENT IMPLEMENTATION
-# =================================
-
-class ReActAgent:
-    def __init__(self):
-        self.llm = llm
-        self.tools = {
-            "web_search": web_search_tool,
-            "calculator": calculator_tool,
-            "search_memory": search_memory_tool
-        }
+def action_node(state: ReActState) -> ReActState:
+    """Execute the planned action"""
+    action = state['action']
+    action_input = state['action_input']
     
-    def think(self, state: ReActState) -> ReActState:
-        """
-        THINKING step: Agent reasons about the problem and decides what to do next
-        """
-        query = state["query"]
-        thoughts = state["thoughts"]
-        actions = state["actions"]
-        observations = state["observations"]
-        iteration = state["iteration"]
-        
-        # Build context from previous iterations
-        context = self._build_context(thoughts, actions, observations)
-        
-        thinking_prompt = f"""
-        You are a ReAct (Reasoning and Acting) agent. You must think step by step and use tools when needed.
-        
-        Query: {query}
-        Current iteration: {iteration}
-        
-        Previous context:
-        {context}
-        
-        IMPORTANT: You MUST use tools to get information. Don't rely on your training data.
-        
-        Available tools (use exact format):
-        - web_search("your search query") - Get current information from web
-        - calculator("mathematical expression") - Calculate numbers 
-        - search_memory("keyword") - Search previous conversation
-        
-        Decision criteria:
-        - If query asks for current/recent information → use web_search
-        - If query involves numbers/calculations → use calculator  
-        - If query references previous conversation → use search_memory
-        - Only use "answer" if you have sufficient information from tools
-        
-        EXAMPLES:
-        - For "what's the weather" → web_search("weather today")
-        - For "what is 15% of 200" → calculator("0.15 * 200")  
-        - For "tell me about bitcoin" → web_search("bitcoin latest news")
-        
-        Think about:
-        1. What type of information is needed?
-        2. Which tool can provide this information?
-        3. What specific query/expression to use?
-        
-        Response format (EXACT):
-        THOUGHT: [your reasoning about what tool to use and why]
-        NEXT_ACTION: [exactly one of: web_search("query"), calculator("expression"), search_memory("keyword"), or "answer"]
-        """
-        
-        try:
-            response = self.llm.invoke(thinking_prompt)
-            thinking_result = response.content
-            
-            # Parse the thinking result
-            if "THOUGHT:" in thinking_result and "NEXT_ACTION:" in thinking_result:
-                thought_part = thinking_result.split("NEXT_ACTION:")[0].replace("THOUGHT:", "").strip()
-                action_part = thinking_result.split("NEXT_ACTION:")[1].strip()
-                
-                state["thoughts"].append(thought_part)
-                
-                return state, action_part
-            else:
-                # Fallback if format is not followed
-                state["thoughts"].append(thinking_result)
-                return state, "answer"
-                
-        except Exception as e:
-            state["thoughts"].append(f"Thinking error: {str(e)}")
-            return state, "answer"
-    
-    def act(self, state: ReActState, action: str) -> ReActState:
-        """
-        ACTING step: Agent uses tools or provides final answer
-        """
-        if action == "answer":
-            return self._provide_final_answer(state)
-        
-        # Parse tool call - improved parsing
-        if action == "answer":
-            return self._provide_final_answer(state)
-        
-        # Better parsing for tool calls
-        if "(" in action and ")" in action:
-            try:
-                # Extract tool name and argument
-                tool_name = action.split("(")[0].strip()
-                # Get everything between first ( and last )
-                args_part = action[action.find("(")+1:action.rfind(")")].strip()
-                # Remove quotes if present
-                tool_args = args_part.strip('"\'')
-                
-                if tool_name in self.tools:
-                    result = self.tools[tool_name](tool_args)
-                    state["actions"].append(f"{tool_name}({tool_args})")
-                    state["observations"].append(result)
-                    state["tools_used"].append(tool_name)
-                    print(f"🔧 ACTION: {tool_name}({tool_args})")
-                    print(f"📊 OBSERVATION: {result}")
-                else:
-                    observation = f"Unknown tool: {tool_name}. Available: {list(self.tools.keys())}"
-                    state["observations"].append(observation)
-                    print(f"❌ UNKNOWN TOOL: {observation}")
-            except Exception as e:
-                observation = f"Tool parsing error: {str(e)}"
-                state["observations"].append(observation)
-                print(f"❌ PARSING ERROR: {observation}")
-        else:
-            observation = f"Invalid action format: {action}. Use tool_name('argument') or 'answer'"
-            state["observations"].append(observation)
-            print(f"❌ INVALID ACTION: {observation}")
-        
+    if action == "final_answer":
+        state['final_answer'] = action_input
+        state['finished'] = True
         return state
     
-    def _provide_final_answer(self, state: ReActState) -> ReActState:
-        """
-        Provide the final answer based on all thinking and observations
-        """
-        query = state["query"]
-        thoughts = state["thoughts"]
-        observations = state["observations"]
-        
-        final_prompt = f"""
-        Based on your thinking process and observations, provide a final answer.
-        
-        Original Query: {query}
-        
-        Your thinking process:
-        {self._format_list(thoughts)}
-        
-        Your observations:
-        {self._format_list(observations)}
-        
-        Provide a comprehensive, well-structured final answer that:
-        1. Directly addresses the original query
-        2. Incorporates insights from your research/calculations
-        3. Is clear and easy to understand
-        4. Cites the tools/information used
-        
-        Final Answer:
-        """
-        
+    # Execute tool
+    if action in TOOLS:
         try:
-            response = self.llm.invoke(final_prompt)
-            state["final_answer"] = response.content
-            print("📝 FINAL ANSWER GENERATED")
+            result = TOOLS[action](action_input)
+            state['observation'] = result
+            # Track tool usage
+            if action not in state['tools_used']:
+                state['tools_used'].append(action)
         except Exception as e:
-            state["final_answer"] = f"Error generating final answer: {str(e)}"
-        
-        return state
+            state['observation'] = f"Tool error: {str(e)}"
+    else:
+        state['observation'] = f"Unknown tool: {action}"
     
-    def _build_context(self, thoughts: List[str], actions: List[str], observations: List[str]) -> str:
-        """
-        Build context from previous iterations
-        """
-        context = ""
-        for i in range(len(thoughts)):
-            context += f"Iteration {i+1}:\n"
-            context += f"  Thought: {thoughts[i]}\n"
-            if i < len(actions):
-                context += f"  Action: {actions[i]}\n"
-            if i < len(observations):
-                context += f"  Observation: {observations[i]}\n"
-            context += "\n"
-        return context
-    
-    def _format_list(self, items: List[str]) -> str:
-        """
-        Format a list of items for display
-        """
-        if not items:
-            return "None"
-        return "\n".join([f"- {item}" for item in items])
-
-# =================================
-# LANGGRAPH IMPLEMENTATION
-# =================================
-
-agent = ReActAgent()
-
-def thinking_node(state: ReActState) -> ReActState:
-    """
-    Node for the thinking process
-    """
-    print(f"🤔 THINKING (Iteration {state['iteration']})")
-    updated_state, next_action = agent.think(state)
-    updated_state["next_action"] = next_action  # Store for decision making
-    return updated_state
-
-def acting_node(state: ReActState) -> ReActState:
-    """
-    Node for the acting process
-    """
-    print(f"🎯 ACTING")
-    next_action = state.get("next_action", "answer")
-    return agent.act(state, next_action)
-
-def increment_iteration(state: ReActState) -> ReActState:
-    """
-    Increment iteration counter
-    """
-    state["iteration"] += 1
     return state
 
-def should_continue(state: ReActState) -> Literal["continue", "finish"]:
-    """
-    Decide whether to continue the ReAct loop or finish
-    """
-    # Check if we have a final answer
-    if state.get("final_answer"):
-        return "finish"
-    
-    # Check iteration limit
-    if state["iteration"] >= state["max_iterations"]:
-        print(f"🔄 Max iterations ({state['max_iterations']}) reached")
-        return "finish"
-    
-    # Check if the last action was "answer"
-    if state.get("next_action") == "answer":
-        return "finish"
-    
+def should_continue(state: ReActState) -> str:
+    """Decide whether to continue or finish"""
+    if state['finished']:
+        return "end"
+    if state['step_count'] >= state['max_steps']:
+        # Force finish if max steps reached
+        state['final_answer'] = "I've reached the maximum number of steps. Based on my analysis so far, I cannot complete this task fully."
+        return "end"
     return "continue"
 
-def build_react_graph():
-    """
-    Build the ReAct pattern graph
-    """
+# Build the ReAct Graph
+def create_react_agent():
     builder = StateGraph(ReActState)
     
     # Add nodes
-    builder.add_node("think", thinking_node)
-    builder.add_node("act", acting_node)
-    builder.add_node("increment", increment_iteration)
+    builder.add_node("reasoning", reasoning_node)
+    builder.add_node("action", action_node)
     
-    # Define flow
-    builder.add_edge(START, "think")
-    builder.add_edge("think", "act")
-    builder.add_edge("act", "increment")
-    
-    # Conditional branching
+    # Add edges
+    builder.set_entry_point("reasoning")
+    builder.add_edge("reasoning", "action")
     builder.add_conditional_edges(
-        "increment",
+        "action",
         should_continue,
         {
-            "continue": "think",
-            "finish": END
+            "continue": "reasoning",
+            "end": END
         }
     )
     
     return builder.compile()
 
-# =================================
-# MAIN EXECUTION
-# =================================
-
-def main():
-    """
-    Main function to run the ReAct agent
-    """
-    graph = build_react_graph()
+# Test the agent
+if __name__ == "__main__":
+    agent = create_react_agent()
     
-    print("🚀 ReAct Agent Ready!")
-    print("This agent uses the Reasoning + Acting pattern with tools.")
-    print("Available tools: web_search, calculator, search_memory\n")
+    print("🤖 ReAct Agent Ready!")
+    print("Try: 'Calculate 15 * 23 + 45'")
+    print("Or: 'What is Python and then calculate 2^8'")
+    print("Type 'exit' to quit\n")
     
     while True:
-        query = input("🧑 Enter your query (or 'exit' to quit): ")
-        
-        if query.lower() in {"exit", "quit"}:
-            print("👋 Goodbye!")
+        user_input = input("🧑 You: ")
+        if user_input.lower() in {"exit", "quit"}:
             break
         
-        # Initialize state
+        # Initial state
         initial_state = {
-            "query": query,
-            "thoughts": [],
-            "actions": [],
-            "observations": [],
+            "input": user_input,
+            "thought": "",
+            "action": "",
+            "action_input": "",
+            "observation": "",
             "final_answer": "",
-            "iteration": 1,
-            "max_iterations": 5,
-            "tools_used": []
+            "step_count": 0,
+            "max_steps": 5,
+            "finished": False,
+            "tools_used": []  # Initialize empty tools list
         }
         
-        print(f"\n🔍 Processing: {query}")
-        print("=" * 60)
+        print("\n🔄 ReAct Process:")
+        print("-" * 50)
         
-        try:
-            # Run the ReAct agent
-            result = graph.invoke(initial_state)
+        # Run the agent with step-by-step streaming
+        current_state = initial_state
+        
+        for step in range(initial_state["max_steps"]):
+            print(f"\n🔄 Step {step + 1}:")
             
-            # Display results
-            print("\n" + "=" * 60)
-            print("📊 REACT PROCESS SUMMARY:")
-            print(f"Total iterations: {result['iteration'] - 1}")
-            print(f"Tools used: {', '.join(set(result['tools_used'])) if result['tools_used'] else 'None'}")
+            # Reasoning step
+            current_state = reasoning_node(current_state)
+            print(f"💭 Thought: {current_state['thought']}")
+            print(f"🎯 Planned Action: {current_state['action']}")
+            print(f"📥 Action Input: {current_state['action_input']}")
             
-            print("\n🧠 THINKING PROCESS:")
-            for i, thought in enumerate(result["thoughts"], 1):
-                print(f"{i}. {thought}")
+            # Action step
+            if current_state['action'] == "final_answer":
+                print(f"✅ Final Answer: {current_state['action_input']}")
+                break
+            elif current_state['action'] in TOOLS:
+                print(f"🔧 Using Tool: {current_state['action']}")
+                current_state = action_node(current_state)
+                print(f"📤 Tool Result: {current_state['observation']}")
+            else:
+                current_state = action_node(current_state)
+                print(f"❌ Tool Error: {current_state['observation']}")
             
-            print("\n🎯 ACTIONS TAKEN:")
-            for i, action in enumerate(result["actions"], 1):
-                print(f"{i}. {action}")
-            
-            print("\n📝 FINAL ANSWER:")
-            print(result["final_answer"])
-            print("\n" + "=" * 60)
-            
-        except Exception as e:
-            print(f"❌ System Error: {str(e)}")
-
-if __name__ == "__main__":
-    main()
-
+            # Check if we should continue
+            if current_state['finished'] or current_state['step_count'] >= current_state['max_steps']:
+                if not current_state['finished']:
+                    print(f"⏰ Reached max steps ({current_state['max_steps']})")
+                break
+        
+        # Summary
+        print(f"\n📊 Summary:")
+        print(f"   Tools Used: {current_state['tools_used'] if current_state['tools_used'] else 'None'}")
+        print(f"   Total Steps: {current_state['step_count']}")
+        print("-" * 50)
+        print()
 
 
 # Example Test Queries:

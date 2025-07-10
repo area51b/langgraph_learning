@@ -1,5 +1,16 @@
+# Core LangGraph and LangChain
 langgraph
 langchain
 google-generativeai
 langchain-google-genai
-python-dotenv
+
+# MCP (Model Context Protocol)
+mcp==1.1.0
+
+# Environment and utilities
+python-dotenv==1.0.1
+
+# Optional: For testing and development
+httpx==0.28.1
+rich==13.9.4
+redis
